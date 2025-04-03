@@ -3,6 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+
 def get_local_ip():
     """返回本机的私有内网 IP 地址"""
     hostname = socket.gethostname()
@@ -12,10 +13,12 @@ def get_local_ip():
             return ip
     raise RuntimeError("无法找到内网 IP")
 
+
 def read_ip_list(path):
     """读取 IP 列表文件"""
-    with open(path, 'r') as f:
+    with open(path, "r") as f:
         return [line.strip() for line in f if line.strip()]
+
 
 def main():
     if len(sys.argv) != 3:
@@ -24,7 +27,7 @@ def main():
 
     parties_num = sys.argv[1]
     base_port = sys.argv[2]
-    ip_file = Path("./test/ip.txt")
+    ip_file = Path("../batch/list/ip.txt")
 
     if not ip_file.exists():
         print(f"错误: {ip_file} 不存在")
@@ -41,16 +44,14 @@ def main():
 
     print(f"检测到本机 IP: {local_ip}")
     print(f"对应的 party_id: {party_id}")
-    print(f"执行命令: ./test {parties_num} {party_id} {base_port}")
+    print(f"执行命令: ./test_triples {parties_num} {party_id} {base_port}")
 
     # 执行程序
     try:
-        subprocess.run(
-            ["./test", parties_num, str(party_id), base_port],
-            check=True
-        )
+        subprocess.run(["./test_triples", parties_num, str(party_id), base_port], check=True)
     except subprocess.CalledProcessError as e:
         print("程序执行失败：", e)
+
 
 if __name__ == "__main__":
     main()
