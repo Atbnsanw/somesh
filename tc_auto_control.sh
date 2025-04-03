@@ -70,4 +70,10 @@ read -p "输入你的选择 (1-6): " choice
 
 case "$choice" in
     1) set_tc "1ms" "1gbit" ;;
-    2) set_tc "100ms" "100mbit"_
+    2) set_tc "100ms" "100mbit" ;;
+    3) set_tc "0.1ms" "10gbit" ;;
+    4) set_tc "0.1ms" "1gbit" ;;
+    5) reset_tc ;;
+    6) show_tc ;;
+    *) echo "❌ 无效选项，退出。" ;;
+esac
