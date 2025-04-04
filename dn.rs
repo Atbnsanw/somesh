@@ -1867,7 +1867,7 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
 
         // Open masked values
         let opened_values = self
-            .open_secrets_parallel(0, self.num_threshold * 2, &masked_values, true)
+            .open_secrets(0, self.num_threshold * 2, &masked_values, true)
             .ok_or(MPCErr::ProtocolError("Failed to open masked values".into()))?;
 
         // Compute c = d-r
@@ -1893,7 +1893,7 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
         let masked_value = <U64FieldEval<P>>::add(r, double_random.1);
 
         let opened_value = self
-            .open_secrets_parallel(0, self.num_threshold * 2, &[masked_value], true)
+            .open_secrets(0, self.num_threshold * 2, &[masked_value], true)
             .ok_or(MPCErr::ProtocolError("Failed to open masked value".into()))?;
         self.mul_count = self.mul_count + 1;
         Ok(<U64FieldEval<P>>::sub(opened_value[0], double_random.0))
@@ -2094,7 +2094,7 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
             return Err(MPCErr::ProtocolError("Invalid party ID".into()));
         }
 
-        let values = self.open_secrets_parallel(party_id, self.num_threshold, shares, false);
+        let values = self.open_secrets(party_id, self.num_threshold, shares, false);
 
         let result = match (self.party_id == party_id, values) {
             (true, Some(v)) => v.into_iter().map(Some).collect(),
@@ -2139,7 +2139,7 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
 
     fn reveal_slice_to_all(&mut self, shares: &[Self::Sharing]) -> MPCResult<Vec<u64>> {
         let results = self
-            .open_secrets_parallel(0, self.num_threshold, shares, true)
+            .open_secrets(0, self.num_threshold, shares, true)
             .ok_or(MPCErr::ProtocolError("Failed to reveal values".into()))?;
 
         Ok(results)
