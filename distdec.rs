@@ -31,7 +31,6 @@ where
 
     let start = Instant::now();
     //generate r over rho and r over vdelta
-    println!("start eda computation");
     let eda_elements = generate_eda_elements(
         backend,
         rng,
@@ -39,7 +38,6 @@ where
         (v_delta as f64).log2() as u64,
         b.len() as u64,
     );
-    println!("finish eda computation");
     let offline_duration = start.elapsed();
 
     let start = Instant::now();
@@ -65,7 +63,7 @@ where
         // exact e shares over vdelta
         res_vec.push(v_delta_mod.reduce(u_prime_shares) + cx);
     }
-    println!("reveal_slice_to_all_z2k");
+
     // compute e_prime_shares + r_shares over v_delta and reveal
     let res: Vec<u64> = backend
         .reveal_slice_to_all_z2k(&res_vec, 64)
@@ -87,7 +85,7 @@ where
             }
         })
         .collect();
-    println!("reveal_slice_z2k");
+
     let res = backend.reveal_slice_z2k(&real_res, 0, 64);
     let online_duration = start.elapsed();
 
@@ -156,14 +154,12 @@ where
     // let r_1:u64 = (0..len1).map(|i| bits[(len2-1) as usize]*(2 as u64 ).pow((i+len2)as u32)).sum();
     // return vec![r_2, r_1+r_2];
     //let bits = generate_shared_bits_z2k(backend, rng, len2 * triples_num, 64);
-    println!("start generate_shared_bits_constant_round_z2k ");
     let bits = generate_shared_bits_constant_round_z2k(
         backend,
         rng,
         len2 * triples_num,
         (len1 + len2) as u32,
     );
-    println!("finish generate_shared_bits_constant_round_z2k ");
     let results: Vec<(u64, u64)> = bits
         .chunks(len2 as usize)
         .map(|chunk| {
@@ -213,13 +209,12 @@ where
         .into_iter()
         .reduce(|x, y| backend.add_z2k_slice(&x, &y, my_power))
         .unwrap();
-    println!("start mul_element_wise_z2k");
+
     let u_vec = backend.mul_element_wise_z2k(&a_vec, &a_vec, my_power);
 
     let v_vec = backend.add_z2k_slice(&u_vec, &a_vec, my_power);
-    println!("start reveal_slice_to_all_z2k");
     let v_vec_open = backend.reveal_slice_to_all_z2k(&v_vec, my_power);
-    println!("finish reveal_slice_to_all_z2k");    
+
     let r_vec: Vec<Option<u64>> = v_vec_open
         .iter()
         .map(|x| solve(m_mod.reduce(*x), k))
