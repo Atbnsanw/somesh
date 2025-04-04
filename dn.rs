@@ -696,6 +696,7 @@ impl<const P: u64> DNBackend<P> {
         shares: &[u64],
         broadcast_result: bool,
     ) -> Option<Vec<u64>> {
+        println!("open_secrets_z2k");
         let batch_size = shares.len();
 
         if self.party_id == reconstructor_id {
@@ -792,6 +793,7 @@ impl<const P: u64> DNBackend<P> {
                 None
             }
         }
+        
     }
 
     /// Reconstructs secrets from shares through polynomial interpolation.
@@ -2145,7 +2147,7 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
     }
 
     fn reveal_slice_to_all_z2k(&mut self, shares: &[u64], k: u32) -> Vec<u64> {
-        if k < 64 {
+        let ret = if k < 64 {
             let m_mod = <PowOf2Modulus<u64>>::new(1u64 << k);
             self.open_secrets_z2k(0, self.num_threshold, shares, true)
                 .unwrap()
@@ -2158,7 +2160,10 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
                 .iter()
                 .map(|&x| x)
                 .collect()
-        }
+        };
+        println!("finish open_secrets_z2k");
+        ret
+
     }
 
     fn reveal_slice_degree_2t_to_all(&mut self, shares: &[Self::Sharing]) -> MPCResult<Vec<u64>> {
