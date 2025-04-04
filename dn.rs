@@ -157,6 +157,64 @@ impl<const P: u64> DNBackend<P> {
     // pub fn netio_lock(&self) -> std::sync::MutexGuard<'_, NetIO> {
     //     self.netio.lock().unwrap()
     // }
+
+     /// Distributes shares from a dealer to selected parties.
+     fn share_secrets(
+        &self,
+        dealer_id: u32,
+        batch_size: usize,
+        shares: Option<&Vec<Vec<u64>>>,
+        target_range: (u32, u32),
+    ) -> Vec<u64> {
+        // Default range is all parties
+        let (start_id, end_id) = target_range;
+
+        if self.party_id == dealer_id {
+            let all_shares = shares.expect("Dealer must provide shares");
+
+            // Send shares only to parties in the target range
+            for party_idx in start_id..end_id {
+                if party_idx as u32 == self.party_id {
+                    continue;
+                }
+
+                let share_buffer: Vec<u8> = all_shares
+                    .iter()
+                    .flat_map(|share_vec| share_vec[party_idx as usize].to_le_bytes())
+                    .collect();
+
+                self.netio
+                    .send(party_idx, &share_buffer)
+                    .expect("Share distribution failed");
+                self.netio
+                    .flush(party_idx)
+                    .expect("Failed to flush network buffer");
+            }
+
+            // Return own shares
+            all_shares
+                .iter()
+                .map(|share_vec| share_vec[self.party_id as usize])
+                .collect()
+        } else if self.party_id >= start_id && self.party_id < end_id {
+            // Only receive shares if we're in the target range
+            let mut buffer = vec![0u8; batch_size * 8];
+
+            self.netio
+                .recv(dealer_id, &mut buffer)
+                .expect("Share reception failed");
+
+            buffer
+                .chunks_exact(8)
+                .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+                .collect()
+        } else {
+            // Not in target range, return empty shares
+            vec![0u64; batch_size]
+        }
+    }
+
+
     fn send_with_retry(
         &self,
         netio: &NetIO,
@@ -395,15 +453,24 @@ impl<const P: u64> DNBackend<P> {
     }
 
     /// Creates secret shares using polynomial of specified degree.
-    fn generate_shares(&mut self, values: &[u64], degree: usize) -> Vec<Vec<u64>> {
+    fn generate_shares(&self, values: &[u64], degree: usize) -> Vec<Vec<u64>> {
         values
             .iter()
             .map(|&value| {
                 // Create polynomial with random coefficients
                 let mut coeffs = vec![0u64; degree + 1];
                 coeffs[0] = value; // Constant term is the secret
-                self.gen_random_field(&mut coeffs[1..=degree]);
-
+                let field_mask = u64::MAX >> P.leading_zeros();
+                        // Fill buffer with field elements using rejection sampling
+                for value in coeffs[1..=degree].iter_mut() {
+                    *value = loop {
+                        let random_value = self.prg.clone().next_u64() & field_mask;
+                        if random_value < P {
+                            break random_value;
+                        }
+                    }
+                }
+                
                 // Evaluate polynomial at each party's point
                 (0..self.num_parties as usize)
                     .map(|party_idx| {
@@ -1915,6 +1982,30 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
         Ok(shares[0])
     }
 
+    // fn input_slice(
+    //     &self,
+    //     values: Option<&[u64]>,
+    //     batch_size: usize,
+    //     party_id: u32,
+    // ) -> MPCResult<Vec<Self::Sharing>> {
+    //     if party_id >= self.num_parties {
+    //         return Err(MPCErr::ProtocolError("Invalid party ID".into()));
+    //     }
+
+    //     let shares = if self.party_id == party_id {
+    //         self.generate_shares_streaming_and_send(
+    //             values.expect("Dealer must provide values"),
+    //             self.num_threshold as usize,
+    //             (0, self.num_parties),
+    //         )
+    //     } else if self.party_id < self.num_parties {
+    //         self.receive_share_column(party_id, batch_size)
+    //     } else {
+    //         vec![0u64; batch_size]
+    //     };
+
+    //     Ok(shares)
+    // }
     fn input_slice(
         &self,
         values: Option<&[u64]>,
@@ -1925,17 +2016,18 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
             return Err(MPCErr::ProtocolError("Invalid party ID".into()));
         }
 
-        let shares = if self.party_id == party_id {
-            self.generate_shares_streaming_and_send(
-                values.expect("Dealer must provide values"),
-                self.num_threshold as usize,
-                (0, self.num_parties),
-            )
-        } else if self.party_id < self.num_parties {
-            self.receive_share_column(party_id, batch_size)
+        let all_shares = if self.party_id == party_id {
+            Some(self.generate_shares(values.unwrap(), self.num_threshold as usize))
         } else {
-            vec![0u64; batch_size]
+            None
         };
+
+        let shares = self.share_secrets(
+            party_id,
+            batch_size,
+            all_shares.as_ref(),
+            (0, self.num_parties),
+        );
 
         Ok(shares)
     }
