@@ -123,18 +123,16 @@ fn thfhe(party_id: u32, num_parties: u32, threshold: u32, base_port: u32) {
         
         let (my_dd_res, (online_duration, offline_duration)) =
             distdec(&mut backend, rng, &public_a, &public_b, &my_sk);
-        let (_, (online_duration1, offline_duration1)) =
-        distdec(&mut backend, rng, &public_a, &public_b, &my_sk);
-
+    
         println!(
             "Party {} had finished the dd-online with time {} ns,",
             party_id,
-            (online_duration+online_duration1).as_nanos()
+            (online_duration+online_duration).as_nanos()
         );
         println!(
             "Party {} had finished the dd-offline with time {} ns,",
             party_id,
-            (offline_duration+offline_duration1).as_nanos()
+            (offline_duration+offline_duration).as_nanos()
         );
 
         if party_id == 0 {
