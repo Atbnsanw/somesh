@@ -1883,7 +1883,7 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
 
         // Open masked values
         let opened_values = self
-            .open_secrets_parallel(0, self.num_threshold, &masked_values, true)
+            .open_secrets(0, self.num_threshold, &masked_values, true)
             .ok_or(MPCErr::ProtocolError("Failed to open masked values".into()))?;
 
         // Compute c = t + d*s + e*r + d*e
