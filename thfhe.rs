@@ -19,7 +19,7 @@ struct Args {
     n: u32,
     // 参数 t
     #[arg(short = 'i')]
-    id: u32,
+    i: u32,
 }
 
 fn main() {
