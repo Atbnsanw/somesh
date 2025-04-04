@@ -114,24 +114,27 @@ fn thfhe(party_id: u32, num_parties: u32, threshold: u32, base_port: u32) {
     
 
     //---------------------------
-    let test_num = 20000;
-    let public_a = vec![public_a_t.clone();test_num];
-    let public_b = vec![public_b_t;test_num];
     backend.init_z2k_triples_from_files();
     if party_id <= threshold {
         
-
+        let test_num = 10000;
+        let public_a = vec![public_a_t.clone();test_num];
+        let public_b = vec![public_b_t;test_num];
+        
         let (my_dd_res, (online_duration, offline_duration)) =
             distdec(&mut backend, rng, &public_a, &public_b, &my_sk);
+        let (_, (online_duration1, offline_duration1)) =
+        distdec(&mut backend, rng, &public_a, &public_b, &my_sk);
+
         println!(
             "Party {} had finished the dd-online with time {} ns,",
             party_id,
-            online_duration.as_nanos()
+            (online_duration+online_duration1).as_nanos()
         );
         println!(
             "Party {} had finished the dd-offline with time {} ns,",
             party_id,
-            offline_duration.as_nanos()
+            (offline_duration+offline_duration1).as_nanos()
         );
 
         if party_id == 0 {
