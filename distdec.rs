@@ -316,4 +316,3 @@ pub fn solve(v: u64, k: u32) -> Option<u64> {
     }
 
     Some(x as u64)
-}
