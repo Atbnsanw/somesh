@@ -1010,17 +1010,23 @@ impl<const P: u64> DNBackend<P> {
                 .collect();
 
             if broadcast_result {
-                let result_buffer: Vec<u8> =
-                    results.iter().flat_map(|&x| x.to_le_bytes()).collect();
 
-                for party_idx in 0..self.num_parties {
-                    if party_idx != self.party_id {
-                        self.netio
-                            .send(party_idx, &result_buffer)
-                            .expect("Broadcast send failed");
-                        self.netio.flush(party_idx).expect("Broadcast flush failed");
+                thread::scope(|s|{
+                    for party_idx in 0..self.num_parties {
+                        let result_buffer: Vec<u8> =
+                        results.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                        let netio_clone = Arc::clone(&self.netio);
+                        if party_idx != self.party_id {
+                            s.spawn(move||{
+                                netio_clone
+                                .send(party_idx, &result_buffer)
+                                .expect("Broadcast send failed");
+                            netio_clone.flush(party_idx).expect("Broadcast flush failed");
+                            });
+                        }
                     }
-                }
+                })
+
             }
 
             Some(results)
@@ -2047,11 +2053,15 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
         sender_id: u32,
         degree: usize,
     ) -> MPCResult<Vec<Self::Sharing>> {
+        let start = Instant::now();
+
         let all_shares = if self.party_id == sender_id {
             Some(self.generate_shares_with_prg(values.unwrap(), degree))
         } else {
             None
         };
+        let duration = start.elapsed();
+        let start = Instant::now();
         let shares = self.share_secrets_with_prg(
             sender_id,
             batch_size,
@@ -2059,6 +2069,8 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
             // only parties P_t ~ P_{n-1} need to send
             (self.num_threshold, self.num_parties),
         );
+        let duration = start.elapsed();
+        println!("share_secrets_with_prg :{:?}", duration.as_secs_f32());
         Ok(shares)
     }
 
