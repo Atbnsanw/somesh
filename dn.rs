@@ -3,20 +3,25 @@
 use crate::{error::MPCErr, MPCBackend, MPCResult};
 use algebra::ntt::NumberTheoryTransform;
 use algebra::random::Prg;
-use algebra::reduce::{Reduce, ReduceAdd, ReduceDouble, ReduceNeg, ReduceSub};
+use algebra::reduce::{Reduce, ReduceAdd, ReduceAddAssign, ReduceDouble, ReduceNeg, ReduceSub};
 use algebra::{modulus::PowOf2Modulus, Field, NttField, U64FieldEval};
 use bytemuck::{cast_slice, cast_slice_mut};
 use crossbeam::channel;
+use matrix::Matrix;
 use network::netio::{NetIO, Participant};
 use network::IO;
+use parking_lot::Mutex;
 use rand::distributions::Uniform;
 use rand::prelude::*;
 use rand::{RngCore, SeedableRng};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
+use std::sync::{mpsc, Arc, MutexGuard};
 use std::time::{Duration, Instant};
+use std::{thread, u64};
+
+mod matrix;
+
 /// MPC backend implementing the DN07 protocol with honest-majority security.
 pub struct DNBackend<const P: u64> {
     party_id: u32,
@@ -50,14 +55,16 @@ pub struct DNBackend<const P: u64> {
     // Precomputed Beaver triples (a, b, c) where c = a*b over z2k
     triplez2k_buffer: VecDeque<(u64, u64, u64)>,
 
-    //pre-shared prg seed
-    shared_prgs_pair_to_pair: Vec<Arc<Mutex<Prg>>>,
+    /// pre-shared prg seed send from low to high, receive from high to low
+    shared_prgs_pair_to_pair_lh: Vec<Arc<Mutex<Prg>>>,
 
-    ////pre-shared prg seed for additive secret sharing
-    shared_prgs_pair_to_pair_additive: Vec<Prg>,
+    /// pre-shared prg seed send from high to low, receive from low to high
+    shared_prgs_pair_to_pair_hl: Vec<Arc<Mutex<Prg>>>,
 
     //pre_shamir_to_additive_vec
     reverse_vander_matrix: Vec<Vec<u64>>,
+
+    prg_van_matrix: Matrix,
 
     //pre_shamir_to_additive_vec
     pre_shamir_to_additive_vec: Vec<u64>,
@@ -115,12 +122,13 @@ impl<const P: u64> DNBackend<P> {
             netio,
             triple_buffer: VecDeque::with_capacity(buffer_size),
             triple_buffer_capacity: buffer_size,
-            shared_prgs_pair_to_pair: Vec::new(),
-            shared_prgs_pair_to_pair_additive: Vec::new(),
+            shared_prgs_pair_to_pair_lh: Vec::new(),
+            shared_prgs_pair_to_pair_hl: Vec::new(),
             triplez2k_buffer: VecDeque::with_capacity(buffer_size),
 
             reverse_vander_matrix: Vec::with_capacity(num_parties as usize),
             pre_shamir_to_additive_vec: Vec::new(),
+            prg_van_matrix: Matrix::default(),
             doublerandom_buffer: VecDeque::with_capacity(buffer_size),
             doublerandom_buffer_capacity: buffer_size,
 
@@ -142,7 +150,6 @@ impl<const P: u64> DNBackend<P> {
         backend.init_shamir_to_additive_vec_z2k();
         if need_prg_init {
             backend.init_pair_to_pair_prg();
-            backend.init_pair_to_pair_prg_addiitive();
         }
 
         if need_mul_init {
@@ -594,39 +601,38 @@ impl<const P: u64> DNBackend<P> {
         let (start_id, end_id) = target_range;
         if self.party_id == dealer_id {
             let all_shares = shares.expect("Dealer must provide shares");
-
-            let mut share_buffer = vec![0u64; batch_size];
-
-            // Send shares only to parties in the target range
-            for party_idx in start_id..end_id {
-                if party_idx == self.party_id {
-                    continue;
-                }
-
-                share_buffer
+            let mut my_shares = vec![0u64; batch_size];
+            std::thread::scope(|s| {
+                // Return own shares
+                my_shares
                     .iter_mut()
                     .zip(all_shares.iter())
                     .for_each(|(share, share_vec)| {
-                        *share = share_vec[party_idx as usize];
+                        *share = share_vec[self.party_id as usize];
                     });
-
-                self.netio
-                    .send(party_idx, cast_slice(&share_buffer))
-                    .expect("Share distribution failed");
-                self.netio
-                    .flush(party_idx)
-                    .expect("Failed to flush network buffer");
-            }
-
-            // Return own shares
-            share_buffer
-                .iter_mut()
-                .zip(all_shares.iter())
-                .for_each(|(share, share_vec)| {
-                    *share = share_vec[self.party_id as usize];
-                });
-
-            share_buffer
+                // Send shares only to parties in the target range
+                for party_idx in start_id..end_id {
+                    if party_idx == self.party_id {
+                        continue;
+                    }
+                    let mut share_buffer = vec![0u64; batch_size];
+                    let netio_clone = Arc::clone(&self.netio);
+                    share_buffer.iter_mut().zip(all_shares.iter()).for_each(
+                        |(share, share_vec)| {
+                            *share = share_vec[party_idx as usize];
+                        },
+                    );
+                    s.spawn(move || {
+                        netio_clone
+                            .send(party_idx, cast_slice(&share_buffer))
+                            .expect("Share distribution failed");
+                        netio_clone
+                            .flush(party_idx)
+                            .expect("Failed to flush network buffer");
+                    });
+                }
+                my_shares
+            })
         } else if self.party_id >= start_id && self.party_id < end_id {
             // Only receive shares if we're in the target range
             let mut buffer = vec![0u64; batch_size];
@@ -638,17 +644,39 @@ impl<const P: u64> DNBackend<P> {
             buffer
         } else {
             // Not in target range, return prg shares
-            let mut my_shares: Vec<u64> = Vec::new();
-            for _i in 0..batch_size {
-                my_shares.push(
-                    self.shared_prgs_pair_to_pair[dealer_id as usize]
-                        .lock()
-                        .unwrap()
-                        .next_u64(),
-                );
-            }
+            let mut my_shares = vec![0u64; batch_size];
+            self.receive_shares_from_pair_to_pair_prg(dealer_id, &mut my_shares);
+            //println!("party {}, receive {:?} from party {}", self.party_id, my_shares,dealer_id);
             my_shares
         }
+    }
+
+    /// get recevie shares from pair to pair prg
+    fn receive_shares_from_pair_to_pair_prg(&self, sender_id: u32, shares: &mut [u64]) {
+        let field_mask = u64::MAX >> P.leading_zeros();
+        if self.party_id < sender_id {
+            let prg_ref = &self.shared_prgs_pair_to_pair_hl[sender_id as usize];
+            let mut prg = prg_ref.lock();
+            prg.fill(shares);
+            shares.iter_mut().for_each(|share| {
+                *share &= field_mask;
+            });
+        } else {
+            let prg_ref = &self.shared_prgs_pair_to_pair_lh[sender_id as usize];
+            let mut prg = prg_ref.lock();
+            prg.fill(shares);
+            shares.iter_mut().for_each(|share| {
+                *share &= field_mask;
+            });
+        };
+    }
+
+    /// get send share from pair to pair prg
+    fn send_share_from_pair_to_pair_prg(&self, prg: &mut Prg) -> u64 {
+        let field_mask = u64::MAX >> P.leading_zeros();
+        let ret: u64 = prg.next_u64() & field_mask;
+        //println!("party {} send {:?} to party {}", self.party_id,ret, receiver_id);
+        ret
     }
 
     /// Distributes shares from a dealer to selected parties.
@@ -660,7 +688,7 @@ impl<const P: u64> DNBackend<P> {
     ) -> Vec<u64> {
         // Default range is all parties
         let num_parties = (self.num_threshold + 1) as usize;
-        let mut my_shares: Vec<u64> = Vec::new();
+        let mut my_shares = vec![0u64; batch_size];
         if sender_id == self.party_id {
             let mut shares = Vec::with_capacity(values.unwrap().len());
             for &val in values.unwrap().iter() {
@@ -669,7 +697,7 @@ impl<const P: u64> DNBackend<P> {
 
                 for (i, ele) in row.iter_mut().enumerate().take(num_parties) {
                     if i != sender_id as usize {
-                        let rand = self.shared_prgs_pair_to_pair_additive[i].next_u64();
+                        let rand = self.shared_prgs_pair_to_pair_lh[i].lock().next_u64();
                         *ele = rand;
                         sum += rand;
                     }
@@ -681,8 +709,11 @@ impl<const P: u64> DNBackend<P> {
             }
         } else {
             for _i in 0..batch_size {
-                my_shares
-                    .push(self.shared_prgs_pair_to_pair_additive[sender_id as usize].next_u64());
+                my_shares.push(
+                    self.shared_prgs_pair_to_pair_lh[sender_id as usize]
+                        .lock()
+                        .next_u64(),
+                );
             }
         }
         my_shares
@@ -792,6 +823,38 @@ impl<const P: u64> DNBackend<P> {
                 None
             }
         }
+    }
+    /// Open secrets z2k, one round
+    pub fn open_secrets_z2k_one_round(&mut self, shares: &[u64]) -> Vec<u64> {
+        thread::scope(|s| {
+            for id in 0..(self.num_threshold + 1) {
+                if id == self.party_id {
+                    continue;
+                } else {
+                    let netio_clone = Arc::clone(&self.netio);
+
+                    s.spawn(move || {
+                        let data_bytes = cast_slice(&shares);
+
+                        netio_clone.send(id, data_bytes).expect("Send failed");
+                        netio_clone.flush(id).expect("Flush failed");
+                    });
+                }
+            }
+            let receiver_vec: Vec<u32> = (0..self.num_threshold + 1)
+                .filter(|x| *x != self.party_id)
+                .collect();
+            let mut all_shares: Vec<u64> = shares.iter().map(|x| *x).collect();
+            let recv_map =
+                self.parallel_recv_from_many(Arc::clone(&self.netio), &receiver_vec, shares.len());
+            for (_, share_vec) in &recv_map {
+                all_shares
+                    .iter_mut()
+                    .zip(share_vec.iter())
+                    .for_each(|(x, y)| *x = *x + *y);
+            }
+            all_shares
+        })
     }
 
     /// Reconstructs secrets from shares through polynomial interpolation.
@@ -1258,9 +1321,9 @@ impl<const P: u64> DNBackend<P> {
     /// next z2k triple
     pub fn next_triple_z2k(&mut self) -> (u64, u64, u64) {
         if self.triplez2k_buffer.is_empty() {
-            //println!("Triples over tiples finished");
-            return (0,0,0)
+            return (0, 0, 0);
         }
+
         self.triplez2k_buffer.pop_front().unwrap()
     }
 
@@ -1374,13 +1437,24 @@ impl<const P: u64> DNBackend<P> {
             self.netio
                 .flush(id)
                 .expect("Failed to flush network buffer");
-            self.shared_prgs_pair_to_pair
+            self.shared_prgs_pair_to_pair_lh
+                .push(Arc::new(Mutex::new(Prg::from_seed(seed))));
+
+            let seed = self.prg.random_block();
+            let seed_bytes: [u8; 16] = seed.into();
+            self.netio
+                .send(id, &seed_bytes)
+                .expect("Seed distribution failed");
+            self.netio
+                .flush(id)
+                .expect("Failed to flush network buffer");
+            self.shared_prgs_pair_to_pair_hl
                 .push(Arc::new(Mutex::new(Prg::from_seed(seed))));
         }
         // push my seed
         let seed = self.prg.random_block();
         let seed_bytes: [u8; 16] = seed.into();
-        self.shared_prgs_pair_to_pair
+        self.shared_prgs_pair_to_pair_lh
             .push(Arc::new(Mutex::new(Prg::from_seed(seed_bytes.into()))));
         //println!("shared pair to pair prg success, {}", self.shared_prgs_pair_to_pair.len());
 
@@ -1392,33 +1466,14 @@ impl<const P: u64> DNBackend<P> {
                 .recv(id, &mut seed_bytes)
                 .expect("Seed reception failed");
             assert_eq!(len, 16, "Invalid PRG seed length");
-            self.shared_prgs_pair_to_pair
+            self.shared_prgs_pair_to_pair_lh
                 .push(Arc::new(Mutex::new(Prg::from_seed(seed_bytes.into()))));
-        }
-
-        self.shared_prgs_pair_to_pair.reverse();
-    }
-
-    fn init_pair_to_pair_prg_addiitive(&mut self) {
-        for id in (self.party_id + 1..self.num_parties).rev() {
-            // Leader generates and distributes seed
-            // println!("my party_id:{}, number_parties:{},",self.party_id, self.num_parties);
-            let seed = self.prg.random_block();
-            let seed_bytes: [u8; 16] = seed.into();
-            self.netio
-                .send(id, &seed_bytes)
-                .expect("Seed distribution failed");
-            self.netio
-                .flush(id)
-                .expect("Failed to flush network buffer");
-            self.shared_prgs_pair_to_pair_additive
-                .push(Prg::from_seed(seed));
         }
         // push my seed
         let seed = self.prg.random_block();
         let seed_bytes: [u8; 16] = seed.into();
-        self.shared_prgs_pair_to_pair_additive
-            .push(Prg::from_seed(seed_bytes.into()));
+        self.shared_prgs_pair_to_pair_hl
+            .push(Arc::new(Mutex::new(Prg::from_seed(seed_bytes.into()))));
         //println!("shared pair to pair prg success, {}", self.shared_prgs_pair_to_pair.len());
 
         for id in (0..self.party_id).rev() {
@@ -1429,11 +1484,12 @@ impl<const P: u64> DNBackend<P> {
                 .recv(id, &mut seed_bytes)
                 .expect("Seed reception failed");
             assert_eq!(len, 16, "Invalid PRG seed length");
-            self.shared_prgs_pair_to_pair_additive
-                .push(Prg::from_seed(seed_bytes.into()));
+            self.shared_prgs_pair_to_pair_hl
+                .push(Arc::new(Mutex::new(Prg::from_seed(seed_bytes.into()))));
         }
 
-        self.shared_prgs_pair_to_pair_additive.reverse();
+        self.shared_prgs_pair_to_pair_lh.reverse();
+        self.shared_prgs_pair_to_pair_hl.reverse();
     }
 
     fn init_shamir_to_additive_vec_z2k(&mut self) {
@@ -1457,12 +1513,20 @@ impl<const P: u64> DNBackend<P> {
             matrix.push(row);
         }
 
-        //println!("self.van_martix:{:?}", self.van_matrix);
+        //println!("self.van_matrix:{:?}", self.van_matrix);
         //println!("matrix: {:?} ",matrix);
         self.reverse_vander_matrix = self.inverse_vandermonde_mod_p(matrix);
+        let temp = Matrix::transposed_sub_matrix_with_data(
+            &self.van_matrix,
+            0,
+            (self.num_threshold + 1) as usize,
+            self.num_threshold as usize,
+            self.num_parties as usize,
+        );
+        self.prg_van_matrix = temp.multiply_with_data::<P>(&self.reverse_vander_matrix);
         //println!("reverse_vander_matrix: {:?}",self.reverse_vander_matrix);
 
-        //println!("van martix:{:?}", self.van_matrix);
+        //println!("van matrix:{:?}", self.van_matrix);
 
         let msize = (self.num_threshold + 1) as usize;
 
@@ -1481,36 +1545,72 @@ impl<const P: u64> DNBackend<P> {
 
     // input values, generates shares where P_0 to P_{t}'s shares are generated by prg and do not require send
     fn generate_shares_with_prg(&self, values: &[u64], degree: usize) -> Vec<Vec<u64>> {
+        let mut prg_ref_vec: Vec<_> = self
+            .shared_prgs_pair_to_pair_hl
+            .iter()
+            .take(self.party_id as usize)
+            .chain(self.shared_prgs_pair_to_pair_lh[self.party_id as usize..].iter())
+            .take(degree + 1)
+            .map(|x| x.lock())
+            .collect::<Vec<_>>();
         let result: Vec<Vec<u64>> = values
             .iter()
             .map(|&value| {
                 let mut fpoint: Vec<u64> = Vec::with_capacity(self.num_threshold as usize + 1);
                 fpoint.push(value); // f(0)
+
+                //fpoint.extend((0..degree).map(|j| self.shared_prgs_pair_to_pair[j].lock().unwrap().next_u64()));
                 fpoint.extend(
-                    (0..degree)
-                        .map(|j| self.shared_prgs_pair_to_pair[j].lock().unwrap().next_u64()),
+                    (0..degree).map(|j| self.send_share_from_pair_to_pair_prg(&mut prg_ref_vec[j])),
                 );
 
-                let coeff: Vec<u64> = self
-                    .reverse_vander_matrix
-                    .iter()
-                    .map(|row| <U64FieldEval<P>>::dot_product(&fpoint, row))
-                    .collect();
-                let extra_shares: Vec<u64> = ((self.num_threshold as usize)
-                    ..(self.num_parties as usize))
-                    .map(|party_idx| {
-                        (0..=degree).fold(0, |sum, j| {
-                            <U64FieldEval<P>>::mul_add(coeff[j], self.van_matrix[j][party_idx], sum)
-                        })
-                    })
-                    .collect();
+                let extra_shares: Vec<u64> = self.prg_van_matrix.multiply_with_vec::<P>(&fpoint);
+
                 fpoint[1..]
                     .iter()
                     .chain(extra_shares.iter())
-                    .cloned()
+                    .copied()
                     .collect()
+
+                // let coeff: Vec<u64> = self
+                //     .reverse_vander_matrix
+                //     .iter()
+                //     .map(|row| {
+                //         <U64FieldEval<P>>::mul_add(
+                //             value,
+                //             row[0],
+                //             <U64FieldEval<P>>::dot_product(&fpoint, &row[1..]),
+                //         )
+                //     })
+                //     .collect();
+
+                // //println!("party {}  poly {:?} ",self.party_id,coeff);
+
+                // let extra_shares: Vec<u64> = ((self.num_threshold as usize)
+                //     ..(self.num_parties as usize))
+                //     .map(|party_idx| {
+                //         coeff
+                //             .iter()
+                //             .zip(self.van_matrix.iter())
+                //             .take(degree + 1)
+                //             .fold(0, |sum, (&coeff, row)| {
+                //                 <U64FieldEval<P>>::mul_add(coeff, row[party_idx], sum)
+                //             })
+                //         // (0..=degree).fold(0, |sum, j| {
+                //         //     <U64FieldEval<P>>::mul_add(coeff[j], self.van_matrix[j][party_idx], sum)
+                //         // })
+                //     })
+                //     .collect();
+                // // fpoint[1..]
+                // //     .iter()
+                // //     .chain(extra_shares.iter())
+                // //     .copied()
+                // //     .collect()
+                // fpoint.extend_from_slice(&extra_shares);
+                // fpoint
             })
             .collect();
+        //println!("party {} generates shares: {:?} ", self.party_id, result);
         result
     }
 
@@ -1952,7 +2052,6 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
         } else {
             None
         };
-
         let shares = self.share_secrets_with_prg(
             sender_id,
             batch_size,
@@ -1960,7 +2059,6 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
             // only parties P_t ~ P_{n-1} need to send
             (self.num_threshold, self.num_parties),
         );
-
         Ok(shares)
     }
 
@@ -2145,20 +2243,29 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
         Ok(results)
     }
 
-    fn reveal_slice_to_all_z2k(&mut self, shares: &[u64], k: u32) -> Vec<u64> {
-        if k < 64 {
-            let m_mod = <PowOf2Modulus<u64>>::new(1u64 << k);
-            self.open_secrets_z2k(0, self.num_threshold, shares, true)
-                .unwrap()
-                .iter()
-                .map(|&x| m_mod.reduce(x))
-                .collect()
+    fn reveal_slice_to_all_z2k(&mut self, shares: &[u64], k: u32, need_leader: bool) -> Vec<u64> {
+        if need_leader {
+            if k < 64 {
+                let m_mod = <PowOf2Modulus<u64>>::new(1u64 << k);
+                self.open_secrets_z2k(0, self.num_threshold, shares, true)
+                    .unwrap()
+                    .iter()
+                    .map(|&x| m_mod.reduce(x))
+                    .collect()
+            } else {
+                self.open_secrets_z2k(0, self.num_threshold, shares, true)
+                    .unwrap()
+            }
         } else {
-            self.open_secrets_z2k(0, self.num_threshold, shares, true)
-                .unwrap()
-                .iter()
-                .map(|&x| x)
-                .collect()
+            if k < 64 {
+                let m_mod = <PowOf2Modulus<u64>>::new(1u64 << k);
+                self.open_secrets_z2k_one_round(shares)
+                    .iter()
+                    .map(|&x| m_mod.reduce(x))
+                    .collect()
+            } else {
+                self.open_secrets_z2k_one_round(shares)
+            }
         }
     }
 
@@ -2301,7 +2408,6 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
         sum_result: &mut [Self::Sharing],
     ) {
         let (tx, rx) = channel::unbounded::<Vec<u64>>();
-
         std::thread::scope(|s| {
             for i in 0..self.num_parties {
                 let tx_clone = tx.clone();
@@ -2321,7 +2427,7 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
                             .unwrap();
                         drop(tx_clone);
                     });
-                } else if i != self.party_id {
+                } else {
                     s.spawn(move || {
                         tx_clone
                             .send(
@@ -2344,7 +2450,7 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
                 sum_result
                     .iter_mut()
                     .zip(res.iter())
-                    .for_each(|(e, res)| *e = self.add_const(*e, *res));
+                    .for_each(|(e, res)| <U64FieldEval<P>>::add_assign(e, *res));
             }
             //});
         });
