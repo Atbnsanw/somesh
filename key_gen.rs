@@ -416,14 +416,15 @@ where
     //     .chunks_exact( big_n * l)
     //     .map(|b_chunk| backend.reveal_slice_degree_2t_to_all(b_chunk).unwrap())
     //     .concat();
-
+    println!("len of b:{}, big_n:{}, l:{}",  batch_mpc_ntt_rlwe
+    .b.len(),big_n,l);
     let mut a_iter = batch_mpc_ntt_rlwe.a.into_iter();
 
     MPCNttBootstrappingKey(
         batch_mpc_ntt_rlwe
             .b
             .as_slice()
-            .chunks_exact(2 * big_n * l)
+            .chunks_exact(1024 * big_n )
             .map(|b_chunk| backend.reveal_slice_degree_2t_to_all(b_chunk).unwrap())
             // b.chunks_exact(2 * big_n * l)
             .map(|b_x| {
