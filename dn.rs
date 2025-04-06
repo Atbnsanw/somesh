@@ -1008,24 +1008,30 @@ impl<const P: u64> DNBackend<P> {
                 .iter()
                 .map(|shares| self.interpolate_polynomial(shares, lagrange_coef))
                 .collect();
-
             if broadcast_result {
-                let result_buffer: Vec<u8> =
-                    results.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                thread::scope(|s| {
+                    for party_idx in 0..self.num_parties {
+                        let result_buffer: Vec<u8> =
+                            results.iter().flat_map(|&x| x.to_le_bytes()).collect();
 
-                for party_idx in 0..self.num_parties {
-                    if party_idx != self.party_id {
-                        self.netio
-                            .send(party_idx, &result_buffer)
-                            .expect("Broadcast send failed");
-                        self.netio.flush(party_idx).expect("Broadcast flush failed");
+                        let netio_clone = Arc::clone(&self.netio);
+                        if party_idx != self.party_id {
+                            s.spawn(move || {
+                                netio_clone
+                                    .send(party_idx, &result_buffer)
+                                    .expect("Broadcast send failed");
+                                netio_clone
+                                    .flush(party_idx)
+                                    .expect("Broadcast flush failed");
+                            });
+                        }
                     }
-                }
+                })
             }
 
             Some(results)
         } else {
-            // 非重构方：发送 share / 等待 broadcast
+            // 
             let should_send = if reconstructor_id <= degree {
                 self.party_id <= degree && self.party_id != reconstructor_id
             } else {
