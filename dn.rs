@@ -3,9 +3,10 @@
 use crate::{error::MPCErr, MPCBackend, MPCResult};
 use algebra::ntt::NumberTheoryTransform;
 use algebra::random::Prg;
-use algebra::reduce::{Reduce, ReduceAdd, ReduceAddAssign, ReduceDouble, ReduceNeg, ReduceSub};
+use algebra::reduce::*;
 use algebra::{modulus::PowOf2Modulus, Field, NttField, U64FieldEval};
 use bytemuck::{cast_slice, cast_slice_mut};
+use core::num;
 use crossbeam::channel;
 use matrix::Matrix;
 use network::netio::{NetIO, Participant};
@@ -16,7 +17,7 @@ use rand::prelude::*;
 use rand::{RngCore, SeedableRng};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{mpsc, Arc, MutexGuard};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use std::{thread, u64};
 
@@ -602,40 +603,37 @@ impl<const P: u64> DNBackend<P> {
         if self.party_id == dealer_id {
             let all_shares = shares.expect("Dealer must provide shares");
             let mut my_shares = vec![0u64; batch_size];
-            std::thread::scope(|s|{
-           
-                        // Return own shares
-            my_shares
-            .iter_mut()
-            .zip(all_shares.iter())
-            .for_each(|(share, share_vec)| {
-                *share = share_vec[self.party_id as usize];
-            });
-            // Send shares only to parties in the target range
-            for party_idx in start_id..end_id {
-                if party_idx == self.party_id {
-                    continue;
+            std::thread::scope(|s| {
+                // Return own shares
+                my_shares
+                    .iter_mut()
+                    .zip(all_shares.iter())
+                    .for_each(|(share, share_vec)| {
+                        *share = share_vec[self.party_id as usize];
+                    });
+                // Send shares only to parties in the target range
+                for party_idx in start_id..end_id {
+                    if party_idx == self.party_id {
+                        continue;
+                    }
+                    let mut share_buffer = vec![0u64; batch_size];
+                    let netio_clone = Arc::clone(&self.netio);
+                    share_buffer.iter_mut().zip(all_shares.iter()).for_each(
+                        |(share, share_vec)| {
+                            *share = share_vec[party_idx as usize];
+                        },
+                    );
+                    s.spawn(move || {
+                        netio_clone
+                            .send(party_idx, cast_slice(&share_buffer))
+                            .expect("Share distribution failed");
+                        netio_clone
+                            .flush(party_idx)
+                            .expect("Failed to flush network buffer");
+                    });
                 }
-                let mut share_buffer = vec![0u64; batch_size];
-                let netio_clone = Arc::clone(&self.netio);
-                share_buffer
-                .iter_mut()
-                .zip(all_shares.iter())
-                .for_each(|(share, share_vec)| {
-                    *share = share_vec[party_idx as usize];
-                });
-                s.spawn( move || {
-
-                    netio_clone
-                        .send(party_idx, cast_slice(&share_buffer))
-                        .expect("Share distribution failed");
-                    netio_clone
-                        .flush(party_idx)
-                        .expect("Failed to flush network buffer");
-                });
-            }
-            my_shares
-        })
+                my_shares
+            })
         } else if self.party_id >= start_id && self.party_id < end_id {
             // Only receive shares if we're in the target range
             let mut buffer = vec![0u64; batch_size];
@@ -768,21 +766,26 @@ impl<const P: u64> DNBackend<P> {
 
             // Broadcast results if needed
             if broadcast_result {
-                let result_buffer: Vec<u8> = results
-                    .iter()
-                    .flat_map(|&result| result.to_le_bytes())
-                    .collect();
-
-                for party_idx in 0..=self.num_threshold {
-                    if party_idx != self.party_id {
-                        self.netio
-                            .send(party_idx, &result_buffer)
-                            .expect("Result broadcast failed");
-                        self.netio
-                            .flush(party_idx)
-                            .expect("Failed to flush network buffer");
+                thread::scope(|s| {
+                    let party_id = self.party_id;
+                    for party_idx in 0..=self.num_threshold {
+                        let result_buffer: Vec<u8> = results
+                            .iter()
+                            .flat_map(|&result| result.to_le_bytes())
+                            .collect();
+                        let netio_clone = Arc::clone(&self.netio);
+                        s.spawn(move || {
+                            if party_idx != party_id {
+                                netio_clone
+                                    .send(party_idx, &result_buffer)
+                                    .expect("Result broadcast failed");
+                                netio_clone
+                                    .flush(party_idx)
+                                    .expect("Failed to flush network buffer");
+                            }
+                        });
                     }
-                }
+                })
             }
 
             Some(results)
@@ -828,38 +831,68 @@ impl<const P: u64> DNBackend<P> {
         }
     }
     /// Open secrets z2k, one round
-    pub fn open_secrets_z2k_one_round(
-        &mut self,
-        shares: &[u64],
-    ) -> Vec<u64> {
-        thread::scope(|s|{
-            for id in 0..(self.num_threshold+1){
-                if id == self.party_id{
+    pub fn open_secrets_z2k_one_round(&mut self, shares: &[u64]) -> Vec<u64> {
+        let num_threshold = self.num_threshold;
+        let party_id = self.party_id;
+        let ret = thread::scope(|s| {
+            let start1 = Instant::now();
+            for id in 0..(num_threshold + 1) {
+                if id == party_id {
                     continue;
-                }else{
+                } else {
                     let netio_clone = Arc::clone(&self.netio);
 
                     s.spawn(move || {
-
                         let data_bytes = cast_slice(&shares);
 
-                        netio_clone
-                            .send(id, data_bytes)
-                            .expect("Send failed");
+                        netio_clone.send(id, data_bytes).expect("Send failed");
                         netio_clone.flush(id).expect("Flush failed");
                     });
-                }};
-            let receiver_vec:Vec<u32> = (0..self.num_threshold+1).filter(|x| *x!=self.party_id).collect();
-            let mut all_shares:Vec<u64> = shares.iter().map(|x| *x).collect();
-            let recv_map =
-            self.parallel_recv_from_many(Arc::clone(&self.netio), &receiver_vec, shares.len());
-            for (_, share_vec) in &recv_map {
-                all_shares.iter_mut().zip(share_vec.iter()).for_each(|(x, y)| {
-                   *x = *x+*y
-                });
+                }
             }
+            // let receiver_vec: Vec<u32> = (0..self.num_threshold + 1)
+            //     .filter(|x| *x != self.party_id)
+            //     .collect();
+
+
+            //let recv_map =
+            //    self.parallel_recv_from_many(Arc::clone(&self.netio), &receiver_vec, shares.len());
+
+            // for (_, share_vec) in &recv_map {
+            //     all_shares
+            //         .iter_mut()
+            //         .zip(share_vec.iter())
+            //         .for_each(|(x, y)| *x = *x + *y);
+            // }
+            let batch_size = shares.len();
+            let (tx, rx) = channel::unbounded::<Vec<u64>>();
+            for id in 0..num_threshold {
+                if id != party_id {
+                    let netio_clone = Arc::clone(&self.netio);
+                    let tx_clone = tx.clone();
+                    let _ = thread::spawn(move || {
+                        let mut buffer = vec![0u64; batch_size];
+                        {
+                            netio_clone
+                                .recv(id, cast_slice_mut(&mut buffer))
+                                .expect("Recv failed");
+                        }
+                        tx_clone.send(buffer)
+                    });
+                }
+            }
+            drop(tx);
+            let mut all_shares: Vec<u64> = shares.iter().map(|x| *x).collect();
+            if let Ok(xv) = rx.recv() {
+                for i in 0..all_shares.len() {
+                    all_shares[i] += xv[i];
+                }
+            }
+            let p3 = start1.elapsed();
             all_shares
-        })
+        });
+
+        ret
     }
 
     /// Reconstructs secrets from shares through polynomial interpolation.
@@ -1015,17 +1048,24 @@ impl<const P: u64> DNBackend<P> {
                 .collect();
 
             if broadcast_result {
-                let result_buffer: Vec<u8> =
-                    results.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                thread::scope(|s| {
+                    for party_idx in 0..self.num_parties {
+                        let result_buffer: Vec<u8> =
+                            results.iter().flat_map(|&x| x.to_le_bytes()).collect();
 
-                for party_idx in 0..self.num_parties {
-                    if party_idx != self.party_id {
-                        self.netio
-                            .send(party_idx, &result_buffer)
-                            .expect("Broadcast send failed");
-                        self.netio.flush(party_idx).expect("Broadcast flush failed");
+                        let netio_clone = Arc::clone(&self.netio);
+                        if party_idx != self.party_id {
+                            s.spawn(move || {
+                                netio_clone
+                                    .send(party_idx, &result_buffer)
+                                    .expect("Broadcast send failed");
+                                netio_clone
+                                    .flush(party_idx)
+                                    .expect("Broadcast flush failed");
+                            });
+                        }
                     }
-                }
+                })
             }
 
             Some(results)
@@ -1367,24 +1407,30 @@ impl<const P: u64> DNBackend<P> {
             let results: Vec<u64> = all_shares.iter().map(|row| row.iter().sum()).collect();
 
             //println!("result: {:?}", results);
-
+            let results_ref = results.as_slice();
             // Broadcast results if needed
-            if broadcast_result {
-                let result_buffer: Vec<u8> = results
-                    .iter()
-                    .flat_map(|&result| result.to_le_bytes())
-                    .collect();
 
-                for party_idx in 0..=self.num_threshold {
-                    if party_idx != self.party_id {
-                        self.netio
-                            .send(party_idx, &result_buffer)
-                            .expect("Result broadcast failed");
-                        self.netio
-                            .flush(party_idx)
-                            .expect("Failed to flush network buffer");
+            if broadcast_result {
+                let party_id = self.party_id;
+                thread::scope(|s| {
+                    for party_idx in 0..=self.num_threshold {
+                        let netio_clone = Arc::clone(&self.netio);
+                        let result_buffer: Vec<u8> = results_ref
+                            .iter()
+                            .flat_map(|&result| result.to_le_bytes())
+                            .collect();
+                        s.spawn(move || {
+                            if party_idx != party_id {
+                                netio_clone
+                                    .send(party_idx, &result_buffer)
+                                    .expect("Result broadcast failed");
+                                netio_clone
+                                    .flush(party_idx)
+                                    .expect("Failed to flush network buffer");
+                            }
+                        });
                     }
-                }
+                });
             }
 
             Some(results)
@@ -2045,31 +2091,6 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
         Ok(shares)
     }
 
-    fn input_slice_with_prg_new(
-        &self,
-        values: Option<&[u64]>,
-        batch_size: usize,
-        party_id: u32,
-    ) -> MPCResult<Vec<Self::Sharing>> {
-        if party_id >= self.num_parties {
-            return Err(MPCErr::ProtocolError("Invalid party ID".into()));
-        }
-
-        let shares = if self.party_id == party_id {
-            self.generate_shares_streaming_and_send(
-                values.expect("Dealer must provide values"),
-                self.num_threshold as usize,
-                (0, self.num_parties),
-            )
-        } else if self.party_id < self.num_parties {
-            self.receive_share_column(party_id, batch_size)
-        } else {
-            vec![0u64; batch_size]
-        };
-
-        Ok(shares)
-    }
-
     fn input_slice_with_prg(
         &self,
         values: Option<&[u64]>,
@@ -2077,15 +2098,12 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
         sender_id: u32,
         degree: usize,
     ) -> MPCResult<Vec<Self::Sharing>> {
-        let start = Instant::now();
-
         let all_shares = if self.party_id == sender_id {
             Some(self.generate_shares_with_prg(values.unwrap(), degree))
         } else {
             None
         };
-        let duration = start.elapsed();
-        let start = Instant::now();
+
         let shares = self.share_secrets_with_prg(
             sender_id,
             batch_size,
@@ -2093,8 +2111,6 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
             // only parties P_t ~ P_{n-1} need to send
             (self.num_threshold, self.num_parties),
         );
-        let duration = start.elapsed();
-        println!("share_secrets_with_prg :{:?}", duration.as_secs_f32());
         Ok(shares)
     }
 
@@ -2280,7 +2296,7 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
     }
 
     fn reveal_slice_to_all_z2k(&mut self, shares: &[u64], k: u32, need_leader: bool) -> Vec<u64> {
-        if need_leader{
+        if need_leader {
             if k < 64 {
                 let m_mod = <PowOf2Modulus<u64>>::new(1u64 << k);
                 self.open_secrets_z2k(0, self.num_threshold, shares, true)
@@ -2292,20 +2308,18 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
                 self.open_secrets_z2k(0, self.num_threshold, shares, true)
                     .unwrap()
             }
-        }else{
-            if k<64{
+        } else {
+            if k < 64 {
                 let m_mod = <PowOf2Modulus<u64>>::new(1u64 << k);
-                self.open_secrets_z2k_one_round(shares).iter()
-                .map(|&x| m_mod.reduce(x))
-                .collect()
-            }else{
+                self.open_secrets_z2k_one_round(shares)
+                    .iter()
+                    .map(|&x| m_mod.reduce(x))
+                    .collect()
+            } else {
                 self.open_secrets_z2k_one_round(shares)
             }
-   
         }
     }
-
-
 
     fn reveal_slice_degree_2t_to_all(&mut self, shares: &[Self::Sharing]) -> MPCResult<Vec<u64>> {
         let results = self
@@ -2493,5 +2507,4 @@ impl<const P: u64> MPCBackend for DNBackend<P> {
             //});
         });
     }
-    
 }
