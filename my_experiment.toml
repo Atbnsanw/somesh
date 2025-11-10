@@ -1,0 +1,34 @@
+# Note that when the choreographers
+# are running inside the docker compose they will have hostnames.
+# But mobygo is running outside of the docker compose and it will
+# not have access have those hostnames, this is why we set the
+# physical_address to localhost as usual.
+#
+# Additionally, there is no need for TLS on the connection between
+# moby (parties) and mobygo (choreographer) because these two components are only
+# used for benchmarking.
+
+[telemetry]
+tracing_service_name = "choreographer"
+tracing_endpoint = "http://127.0.0.1:4317"
+
+[telemetry.batch]
+max_queue_size = 8192
+max_export_batch_size = 2048
+max_concurrent_exports = 2
+scheduled_delay_ms = 100
+export_timeout_ms = 5000
+
+[threshold_topology]
+threshold = 1
+peers = [
+    
+    { physical_address = "54.210.159.48", logical_address = "p1", physical_port = 50001, logical_port = 50000, choreo_physical_port = 60001, choreo_logical_port = 60000, id = 1, use_tls = true },
+    
+    { physical_address = "13.220.95.97", logical_address = "p2", physical_port = 50002, logical_port = 50000, choreo_physical_port = 60002, choreo_logical_port = 60000, id = 2, use_tls = true },
+    
+    { physical_address = "18.212.219.190", logical_address = "p3", physical_port = 50003, logical_port = 50000, choreo_physical_port = 60003, choreo_logical_port = 60000, id = 3, use_tls = true },
+    
+    { physical_address = "13.217.232.82", logical_address = "p4", physical_port = 50004, logical_port = 50000, choreo_physical_port = 60004, choreo_logical_port = 60000, id = 4, use_tls = true },
+    
+]
