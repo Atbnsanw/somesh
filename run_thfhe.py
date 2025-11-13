@@ -14,7 +14,7 @@ def get_local_ip():
 
 def read_ip_list(path):
     """读取 ip.txt 并返回去除换行的 IP 列表"""
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding="utf-8-sig") as f:
         return [line.strip() for line in f if line.strip()]
 
 def main():
